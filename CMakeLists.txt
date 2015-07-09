@@ -3,14 +3,14 @@ project(KIROCS C)
 
 set(CMAKE_INCLUDE_CURRENT_DIR TRUE)
 
-set(TARNAME "kiro-camera-server")
+set(TARNAME "uca-kiro")
 set(LIBKIROCS_VERSION_MAJOR "0")
 set(LIBKIROCS_VERSION_MINOR "0")
 set(LIBKIROCS_VERSION_PATCH "1")
 set(LIBKIROCS_VERSION_RELEASE "0")
 set(LIBKIROCS_VERSION_STRING "${LIBKIROCS_VERSION_MAJOR}.${LIBKIROCS_VERSION_MINOR}.${LIBKIROCS_VERSION_PATCH}")
 set(VERSION "${LIBKIROCS_VERSION_STRING}")
-set(LIBKIROCS_DESCRIPTION "Small InfiniBand communication Server and Client")
+set(LIBKIROCS_DESCRIPTION "KIRO InfiniBand camera remote control server and plugin for libuca")
 
 # Increase the ABI version when binary compatibility cannot be guaranteed, e.g.
 # symbols have been removed, function signatures, structures, constants etc.
@@ -30,6 +30,8 @@ pkg_check_modules(GMODULE2 gmodule-2.0>=2.32 REQUIRED)
 pkg_check_modules(GIO2 gio-2.0>=2.32 REQUIRED)
 pkg_check_modules(LIBUCA libuca>=2.0 REQUIRED)
 pkg_check_modules(KIRO kiro>=1.4 REQUIRED)
+
+pkg_check_variable(libuca plugindir)
 
 include_directories(
     SYSTEM
@@ -62,3 +64,4 @@ set(LIBKIROCS_BUILD_DIR ${CMAKE_CURRENT_BINARY_DIR})
 add_definitions(-Wall -Wextra -std=c99)
 
 add_subdirectory(bin)
+add_subdirectory(src)

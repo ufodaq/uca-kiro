@@ -19,7 +19,7 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include "kiro-camera-server.h"
+#include "uca-kiro-camera.h"
 #include "uca/uca-plugin-manager.h"
 
 
@@ -124,20 +124,6 @@ gtype_size (GType type)
 }
 
 
-gint
-property_id_from_name(const gchar* name)
-{
-    gint idx = 0;
-    gboolean found = FALSE;
-    for (;idx < N_BASE_PROPERTIES; ++idx) {
-        if (0 == g_strcmp0(name, uca_camera_props[idx])) {
-            found = TRUE;
-            break;
-        }
-    }
-    return found ? idx : -1;
-}
-
 static void
 print_cam_name (gchar *name, gpointer unused)
 {
@@ -222,7 +208,6 @@ connect_callback (gulong rank, gulong *storage)
 static KiroContinueFlag
 receive_callback (KiroMessageStatus *status, KiroCsData *data)
 {
-    PropUpdate *update = (PropUpdate *)status->message->payload; 
 
     if (status->message->msg == KIROCS_EXIT) {
         g_message ("Peer requested shut down...");
@@ -230,6 +215,8 @@ receive_callback (KiroMessageStatus *status, KiroCsData *data)
     }
 
     if (status->message->msg == KIROCS_UPDATE) {
+        PropUpdate *update = (PropUpdate *)status->message->payload; 
+
         g_debug ("Unpacking ID %u\n", update->id);
         gpointer unpacked = unpack_scalar (update); 
 
@@ -240,6 +227,7 @@ receive_callback (KiroMessageStatus *status, KiroCsData *data)
                                 data->properties[update->id -1]->value_type,
                                 data->signal_handlers[update->id],
                                 unpacked);
+
         g_free (unpacked);
 
     }
