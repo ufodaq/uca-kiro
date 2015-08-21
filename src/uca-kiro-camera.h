@@ -76,28 +76,43 @@ G_END_DECLS
 //HELPER FUNCTIONS AND CONSTRUCTS FOR SERVER AND CAMERA PLUGIN
 typedef enum {
     KIROCS_UPDATE,
+    KIROCS_FETCH,
     KIROCS_INSTALL,
     KIROCS_READY,
     KIROCS_RPC,
     KIROCS_EXIT
-}KiroCsCommands;
+} KiroCsCommands;
+
+typedef enum {
+    KIROCS_RPC_START_RECORDING,
+    KIROCS_RPC_STOP_RECORDING,
+    KIROCS_RPC_START_READOUT,
+    KIROCS_RPC_STOP_READOUT,
+    KIROCS_RPC_TRIGGER,
+    KIROCS_RPC_GRAB,
+    KIROCS_RPC_READOUT
+//  KIROCS_RPC_WRITE is currently not supported
+} KiroCsRPC;
 
 typedef struct {
     guint32 id;
     guint32 size;
     gboolean scalar;
-    gchar type[2];
-    gchar val[1];
 } PropUpdate;
 
 typedef struct {
-    guint32 str_len;
-    gchar str[1];
-}StrProp;
+    PropUpdate base;
+    guint64 prop_raw;
+} PropUpdateScalar;
 
 typedef struct {
+    PropUpdate base;
+    gchar str[1];
+} PropUpdateString;
+
+typedef struct {
+    guint32 id;
     GType value_type;
-    guint32 name_len;
     union PSpecs {
         GParamSpecBoolean bool_spec;
         GParamSpecChar char_spec;
@@ -109,7 +124,6 @@ typedef struct {
         GParamSpecUInt64 uint64_spec;
         GParamSpecFloat float_spec;
         GParamSpecDouble double_spec;
-        StrProp str_spec;
     } spec;
     gchar name[1];
 } PropertyRequisition;
@@ -381,18 +395,136 @@ variant_from_scalar (GValue *value)
 }
 
 
-gint
-property_id_from_name(const gchar* name)
+guint
+property_id_from_name(const gchar* name, guint n_props, GParamSpec **props)
 {
-    gint idx = 0;
+    guint idx = 0;
     gboolean found = FALSE;
-    for (;idx < N_BASE_PROPERTIES; ++idx) {
-        if (0 == g_strcmp0(name, uca_camera_props[idx])) {
+    for (;idx < n_props; ++idx) {
+        if (0 == g_strcmp0(name, props[idx]->name)) {
             found = TRUE;
             break;
         }
     }
-    return found ? idx : -1;
+    return found ? (idx + 1) : 0;
 }
+
+
+void
+g_value_write_to_raw_data (const GValue *value, gpointer raw)
+{
+    GType type = G_VALUE_TYPE (value);
+
+    switch (type) {
+        case G_TYPE_BOOLEAN:
+            *(gboolean *)raw = g_value_get_boolean (value);
+            break;
+        case G_TYPE_CHAR:
+            *(gchar *)raw = g_value_get_char (value);
+            break;
+        case G_TYPE_INT:
+            *(gint *)raw = g_value_get_int (value);
+            break;
+        case G_TYPE_ENUM:
+            *(gint *)raw = g_value_get_enum (value);
+            break;
+        case G_TYPE_UINT:
+            *(guint *)raw = g_value_get_uint (value);
+            break;
+        case G_TYPE_LONG:
+            *(glong *)raw = g_value_get_long (value);
+            break;
+        case G_TYPE_ULONG:
+            *(gulong *)raw = g_value_get_ulong (value);
+            break;
+        case G_TYPE_INT64:
+            *(gint64 *)raw = g_value_get_int64 (value);
+            break;
+        case G_TYPE_UINT64:
+            *(guint64 *)raw = g_value_get_uint64 (value);
+            break;
+        case G_TYPE_FLOAT:
+            *(gfloat *)raw = g_value_get_float (value);
+            break;
+        case G_TYPE_DOUBLE:
+            *(gdouble *)raw = g_value_get_double (value);
+            break;
+        default:
+            //TRIGGER_TYPE and TRIGGER_SOURCE are not statically typed and can
+            //not be used in a switch statement...
+            if (type == UCA_TYPE_CAMERA_TRIGGER_SOURCE) {
+                *(gint *)raw = g_value_get_int (value);
+                break;
+            }
+
+            if (type ==  UCA_TYPE_CAMERA_TRIGGER_TYPE) {
+                *(gint *)raw = g_value_get_int (value);
+                break;
+            }
+
+            g_critical ("Type %s not handled! (GET)", g_type_name (type));
+            break;
+    }
+}
+
+
+void
+g_value_set_from_raw_data (GValue *value, gpointer raw)
+{
+    GType type = G_VALUE_TYPE (value);
+
+    switch (type) {
+        case G_TYPE_BOOLEAN:
+            g_value_set_boolean (value, *(gboolean *)raw);
+            break;
+        case G_TYPE_CHAR:
+            g_value_set_char (value, *(gchar *)raw);
+            break;
+        case G_TYPE_INT:
+            g_value_set_int (value, *(gint *)raw);
+            break;
+        case G_TYPE_ENUM:
+            g_value_set_enum (value, *(gint *)raw);
+            break;
+        case G_TYPE_UINT:
+            g_value_set_uint (value, *(guint *)raw);
+            break;
+        case G_TYPE_LONG:
+            g_value_set_long (value, *(glong *)raw);
+            break;
+        case G_TYPE_ULONG:
+            g_value_set_ulong (value, *(gulong *)raw);
+            break;
+        case G_TYPE_INT64:
+            g_value_set_int64 (value, *(gint64 *)raw);
+            break;
+        case G_TYPE_UINT64:
+            g_value_set_uint64 (value, *(guint64 *)raw);
+            break;
+        case G_TYPE_FLOAT:
+            g_value_set_float (value, *(gfloat *)raw);
+            break;
+        case G_TYPE_DOUBLE:
+            g_value_set_double (value, *(gdouble *)raw);
+            break;
+        default:
+            //TRIGGER_TYPE and TRIGGER_SOURCE are not statically typed and can
+            //not be used in a switch statement...
+            if (type == UCA_TYPE_CAMERA_TRIGGER_SOURCE) {
+                g_value_set_enum (value, *(gint *)raw);
+                break;
+            }
+
+            if (type ==  UCA_TYPE_CAMERA_TRIGGER_TYPE) {
+                g_value_set_enum (value, *(gint *)raw);
+                break;
+            }
+
+            g_critical ("Type %s not handled! (SET)", g_type_name (type));
+            break;
+    }
+}
+
+
 
 #endif

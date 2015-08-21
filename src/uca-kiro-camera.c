@@ -59,6 +59,17 @@ static const gint kiro_overrideables[] = {
 
 static GParamSpec *kiro_properties[N_PROPERTIES] = { NULL, };
 
+//+1 to make index and property ID identical
+static guint64 kiro_scalar_prop_buffers[N_PROPERTIES] = { 0, };
+
+typedef struct {
+    GParamSpec *pspec;
+    guint32 remote_id;
+    guint32 local_id;
+    guint64 buffer;
+} KiroDynamicScalarProperty;
+
+
 struct _UcaKiroCameraPrivate {
     guint8 *dummy_data;
     guint current_frame;
@@ -66,7 +77,8 @@ struct _UcaKiroCameraPrivate {
     gchar *kiro_address;
     gchar *kiro_port;
     gchar *remote_name;
-    GParamSpec **kiro_dynamic_attributes;
+    GList *property_install_list;
+    KiroDynamicScalarProperty *kiro_dynamic_scalar_properties;
 
     gboolean thread_running;
     gboolean kiro_connected;
@@ -75,11 +87,13 @@ struct _UcaKiroCameraPrivate {
     GThread *grab_thread;
     KiroMessenger *messenger;
     gulong peer_rank;
+    KiroRequest *rec_request;
 
     guint roi_height;
     guint roi_width;
     guint bytes_per_pixel;
 };
+
 
 static gpointer
 kiro_grab_func(gpointer data)
@@ -223,7 +237,7 @@ uca_kiro_camera_grab (UcaCamera *camera, gpointer data, GError **error)
     /* gpointer frame = kiro_sb_get_data_blocking (priv->receive_buffer); */
 
     /* kiro_sb_freeze (priv->receive_buffer); */
-    /* //Element 0 might still be in the process of being written. */ 
+    /* //Element 0 might still be in the process of being written. */
     /* //Therefore, we take Element 1, to be sure this one is finished. */
     /* if (data) */
     /*     g_memmove (data, frame, priv->roi_width * priv->roi_height * priv->bytes_per_pixel); */
@@ -270,22 +284,69 @@ kiro_address_decode (const gchar *addr_in, gchar **addr, gchar **port, GError **
 }
 
 
-static KiroContinueFlag
-receive_handler (KiroMessageStatus *status, gpointer user_data)
+static void
+null_callback (gpointer unused)
+{
+    (void)unused;
+}
+
+
+
+
+void
+receive_handler (KiroRequest *request, gpointer user_data)
 {
     UcaKiroCamera *cam = (UcaKiroCamera *)user_data;
     UcaKiroCameraPrivate *priv = UCA_KIRO_CAMERA_GET_PRIVATE (cam);
-    
-    KiroMessage *msg = status->message;
+
+    KiroMessage *msg = request->message;
+
+    if (msg->msg == KIROCS_INSTALL) {
+        PropertyRequisition *req = (PropertyRequisition *)msg->payload;
+        g_debug ("Got requisition for a non-base property '%s' of type '%s' with ID %u", req->name, g_type_name (req->value_type),
+                req->id);
+        priv->property_install_list = g_list_append (priv->property_install_list, msg->payload);
+        msg->payload = NULL;
+        goto done;
+    }
 
     if (msg->msg == KIROCS_READY) {
         g_debug ("Interface Setup Done.");
         priv->kiro_connected = TRUE;
-        return KIRO_CALLBACK_CONTINUE;
+        goto done;
+    }
+
+    if (msg->msg == KIROCS_UPDATE) {
+        PropUpdate *update = (PropUpdate *)request->message->payload;
+        const gchar *name = NULL;
+        gpointer buffer = NULL;
+
+        if (update->scalar == TRUE) {
+            PropUpdateScalar *scalar_update = (PropUpdateScalar *)request->message->payload;
+
+            if (update->id >= N_BASE_PROPERTIES) {
+                name = priv->kiro_dynamic_scalar_properties[update->id - N_BASE_PROPERTIES].pspec->name;
+                buffer = &priv->kiro_dynamic_scalar_properties[update->id - N_BASE_PROPERTIES].buffer;
+            }
+            else {
+                name = uca_camera_props[update->id];
+                buffer = &kiro_scalar_prop_buffers[update->id];
+            }
+
+            memcpy (buffer, &scalar_update->prop_raw, sizeof (guint64));
+        }
+
+        g_debug ("Peer informed us about an update of property '%s' (ID: %u)", name, update->id);
+        goto done;
     }
 
     g_message ("Message Type '%u' is unhandled.", msg->msg);
-    return KIRO_CALLBACK_CONTINUE;
+
+done:
+    if (msg->payload)
+        g_free (msg->payload);
+    g_free (msg);
+    kiro_messenger_receive (priv->messenger, request);
 }
 
 
@@ -301,21 +362,63 @@ uca_kiro_camera_clone_interface(UcaKiroCamera *kiro_camera)
         priv->messenger = kiro_messenger_new ();
     }
 
-    priv->kiro_connected = FALSE;
+    priv->rec_request = g_malloc0 (sizeof (KiroRequest));
+    priv->rec_request->id = 0;
+    priv->rec_request->callback = (KiroMessageCallbackFunc) receive_handler;
+    priv->rec_request->user_data = (gpointer) kiro_camera;
+    kiro_messenger_receive (priv->messenger, priv->rec_request);
 
-    kiro_messenger_add_receive_callback (priv->messenger, receive_handler, kiro_camera);
+    priv->kiro_connected = FALSE;
     kiro_messenger_connect (priv->messenger, priv->kiro_address, priv->kiro_port, &priv->peer_rank, &initable_iface_error);
     if (initable_iface_error) {
         priv->construction_error = TRUE;
-        kiro_messenger_remove_receive_callback (priv->messenger);
+        g_free (priv->rec_request);
         return;
     }
 
     //Wait until the remote side has given us the "READY" signal
-    while (!priv->kiro_connected) {};  
+    while (!priv->kiro_connected) {};
+
+    guint count = g_list_length (priv->property_install_list);
+    if (count > 0) {
+        g_debug ("Registering buffers for %u dyanmic properties", count);
+        priv->kiro_dynamic_scalar_properties = g_malloc0 (count * sizeof (KiroDynamicScalarProperty));
+        GList *curr = g_list_first (priv->property_install_list);
+        guint idx = 0;
+        while (curr) {
+            PropertyRequisition *req = (PropertyRequisition *)curr->data;
+            g_debug ("Registering dynamic property '%s'", req->name);
+            GParamSpec *pspec = g_param_spec_boolean (req->name, "Remote Property",
+                                                      "Remote Property", TRUE, G_PARAM_READWRITE);
+            guint local_id = N_PROPERTIES + idx;
+            g_object_class_install_property (gobject_class, local_id, pspec);
+
+            priv->kiro_dynamic_scalar_properties[idx].local_id = local_id;
+            priv->kiro_dynamic_scalar_properties[idx].remote_id = req->id;
+            priv->kiro_dynamic_scalar_properties[idx].pspec = pspec;
+
+            KiroMessage message;
+            message.msg = KIROCS_FETCH;
+            message.size = strlen (req->name) + 1; //Don't forget the NULL-byte
+            message.payload = &(req->name);
+
+            g_debug ("Sending request to fetch value of property '%s'", req->name);
+            GError *error = NULL;
+            kiro_messenger_send_blocking (priv->messenger, &message, priv->peer_rank, &error);
+            if (error) {
+                g_error ("Oh shit! (%s)", error->message);
+                g_error_free (error);
+            }
+
+            idx++;
+            curr = g_list_next (curr);
+        }
+        g_list_free (priv->property_install_list);
+    }
+
+
 
     if (priv->construction_error) {
-        //something went wrong. Tear down the connection.
         kiro_messenger_stop (priv->messenger);
 
         //TODO
@@ -337,7 +440,7 @@ uca_kiro_camera_set_property(GObject *object, guint property_id, const GValue *v
             priv->kiro_address_string  = g_value_dup_string (value);
             break;
         default:
-            g_debug ("Updating %s.", pspec->name); 
+            g_debug ("Updating %s.", pspec->name);
 
             if (!priv->kiro_connected) {
                 g_warning ("Trying to modify a property before a connection to the remote camera was established.");
@@ -345,31 +448,40 @@ uca_kiro_camera_set_property(GObject *object, guint property_id, const GValue *v
                 return;
             }
 
-            GError *error = NULL;
-
-            GVariant *tmp = variant_from_scalar (value);
-            gsize data_size = g_variant_get_size (tmp);
-
-            PropUpdate *test = g_malloc0 (sizeof (PropUpdate) + data_size);
-            test->id = property_id_from_name (pspec->name);
-            test->type[0] = gtype_to_gvariant_class (pspec->value_type);
-            test->size = data_size;
-            g_variant_store (tmp, test->val);
-            g_variant_unref (tmp);
+            if (property_id >= N_PROPERTIES) {
+                g_debug ("Non-Base-Property ID %u (Index: %u)", property_id, property_id - N_PROPERTIES);
+                g_value_write_to_raw_data (value, &(priv->kiro_dynamic_scalar_properties[property_id - N_PROPERTIES].buffer));
+            }
+            else
+                g_value_write_to_raw_data (value, &kiro_scalar_prop_buffers[property_id]);
 
             KiroMessage message;
-            message.peer_rank = priv->peer_rank;
             message.msg = KIROCS_UPDATE;
-            message.payload = test;
-            message.size = sizeof (PropUpdate) + data_size;
+            message.size = sizeof (PropUpdate) + sizeof (guint64);
+            message.payload = g_malloc0 (message.size);
+            gpointer data_pointer = message.payload + sizeof (PropUpdate);
 
-            kiro_messenger_send_blocking (priv->messenger, &message, &error);
-            if (error) {
-                g_free (test);
-                g_error ("Oh shit! (%s)", error->message);
+            PropUpdate *update = (PropUpdate *)message.payload;
+            update->size = 1;
+            update->scalar = TRUE;
+
+            if (property_id > N_BASE_PROPERTIES) {
+                update->id = priv->kiro_dynamic_scalar_properties[property_id - N_PROPERTIES].remote_id;
+                memcpy (data_pointer, &(priv->kiro_dynamic_scalar_properties[property_id - N_PROPERTIES].buffer), sizeof (guint64));
+            }
+            else {
+                update->id = property_id;
+                memcpy (data_pointer, &kiro_scalar_prop_buffers[property_id], sizeof (guint64));
             }
 
-            g_free (test);
+
+            GError *error = NULL;
+            kiro_messenger_send_blocking (priv->messenger, &message, priv->peer_rank, &error);
+            if (error) {
+                g_error ("Oh shit! (%s)", error->message);
+                g_error_free (error);
+            }
+            g_free (message.payload);
     }
 }
 
@@ -390,7 +502,14 @@ uca_kiro_camera_get_property(GObject *object, guint property_id, GValue *value, 
             g_value_set_string (value, priv->remote_name);
             break;
         default:
-            //try_handle_read_tango_property (object, property_id, value, pspec);
+            //TODO:
+            //Handle non-scalar types specifically
+            if (property_id <= N_BASE_PROPERTIES) {
+                g_value_set_from_raw_data (value, &kiro_scalar_prop_buffers[property_id]);
+            }
+            else {
+                g_value_set_from_raw_data (value, &(priv->kiro_dynamic_scalar_properties[property_id - N_PROPERTIES].buffer));
+            }
             break;
     }
 }
@@ -429,13 +548,13 @@ ufo_kiro_camera_initable_init (GInitable *initable,
                                GError **error)
 {
     g_return_val_if_fail (UCA_IS_KIRO_CAMERA (initable), FALSE);
-    
+
     UcaKiroCameraPrivate *priv = UCA_KIRO_CAMERA_GET_PRIVATE (UCA_KIRO_CAMERA (initable));
     if(priv->construction_error) {
         g_propagate_error (error, initable_iface_error);
         return FALSE;
     }
-    
+
     return TRUE;
 }
 
@@ -448,16 +567,16 @@ uca_kiro_initable_iface_init (GInitableIface *iface)
 static void
 uca_kiro_camera_constructed (GObject *object)
 {
-    //Initialization for the KIRO Server and TANGO Interface cloning is moved
+    //Initialization for the KIRO Messenger and interface cloning is moved
     //here and done early!
     //We want to add dynamic properties and it is too late to do so in the
     //real initable part. Therefore, we do it here and 'remember' any errors
     //that occur and check them later in the initable part.
-    
+
     UcaKiroCamera *self = UCA_KIRO_CAMERA (object);
     UcaKiroCameraPrivate *priv = UCA_KIRO_CAMERA_GET_PRIVATE (self);
     priv->construction_error = FALSE;
-    
+
     GValue address = G_VALUE_INIT;
     g_value_init(&address, G_TYPE_STRING);
     uca_kiro_camera_get_property (object, PROP_KIRO_ADDRESS, &address, NULL);
@@ -502,7 +621,7 @@ uca_kiro_camera_class_init(UcaKiroCameraClass *klass)
 
     for (guint i = 0; i < N_BASE_PROPERTIES; i++)
         g_object_class_override_property (gobject_class, i, uca_camera_props[i]);
-                
+
     kiro_properties[PROP_KIRO_ADDRESS] =
         g_param_spec_string("kiro-address",
                 "KIRO Server Address",
@@ -512,8 +631,8 @@ uca_kiro_camera_class_init(UcaKiroCameraClass *klass)
 
     kiro_properties[PROP_KIRO_REMOTE_NAME] =
         g_param_spec_string("remote-name",
-                "Name of the remot camera",
-                "Name of the camera plugin that is loaded on the KIRO remote site",
+                "Name of the remote camera",
+                "Name of the camera plugin that is loaded on the KIRO remote side",
                 "NONE",
                 G_PARAM_READABLE);
 
@@ -530,11 +649,9 @@ uca_kiro_camera_init(UcaKiroCamera *self)
     self->priv->grab_thread = NULL;
     self->priv->current_frame = 0;
     self->priv->kiro_address_string = g_strdup ("NONE");
-    self->priv->kiro_address = g_strdup ("NONE");
-    self->priv->kiro_port = g_strdup ("NONE");
     self->priv->remote_name = g_strdup ("NONE");
     self->priv->construction_error = FALSE;
-    self->priv->kiro_dynamic_attributes = NULL;
+    self->priv->kiro_dynamic_scalar_properties = NULL;
 
     self->priv->messenger = kiro_messenger_new ();
     self->priv->peer_rank = 0;
